@@ -2,14 +2,15 @@ import React, { useEffect, useRef } from "react";
 import { IDisposable, Terminal as XtermTerminal } from "@xterm/xterm";
 import { FitAddon } from "xterm-addon-fit";
 import "@xterm/xterm/css/xterm.css";
+import socket from "../state/socket";
 
 class JsonWebsocketAddon {
   _socket: WebSocket;
 
   _disposables: IDisposable[];
 
-  constructor(socket: WebSocket) {
-    this._socket = socket;
+  constructor(_socket: WebSocket) {
+    this._socket = _socket;
     this._disposables = [];
   }
 
@@ -21,9 +22,15 @@ class JsonWebsocketAddon {
       }),
     );
     this._socket.addEventListener("message", (event) => {
-      const { message } = JSON.parse(event.data);
-      if (message.action === "terminal") {
-        terminal.write(message.data);
+      const { action, args, observation, content } = JSON.parse(event.data);
+      if (action === "run") {
+        terminal.writeln(args.command);
+      }
+      if (observation === "run") {
+        content.split("\n").forEach((line: string) => {
+          terminal.writeln(line);
+        });
+        terminal.write("\n$ ");
       }
     });
   }
@@ -34,9 +41,18 @@ class JsonWebsocketAddon {
   }
 }
 
-function Terminal(): JSX.Element {
+type TerminalProps = {
+  hidden: boolean;
+};
+
+/**
+ * The terminal's content is set by write messages. To avoid complicated state logic,
+ * we keep the terminal persistently open as a child of <App /> and hidden when not in use.
+ */
+
+function Terminal({ hidden }: TerminalProps): JSX.Element {
   const terminalRef = useRef<HTMLDivElement>(null);
-  const WS_URL = import.meta.env.VITE_TERMINAL_WS_URL;
+
   useEffect(() => {
     const terminal = new XtermTerminal({
       // This value is set to the appropriate value by the
@@ -48,6 +64,7 @@ function Terminal(): JSX.Element {
       fontFamily: "Menlo, Monaco, 'Courier New', monospace",
       fontSize: 14,
     });
+    terminal.write("$ ");
 
     const fitAddon = new FitAddon();
     terminal.loadAddon(fitAddon);
@@ -60,12 +77,6 @@ function Terminal(): JSX.Element {
       fitAddon.fit();
     }, 1);
 
-    if (!WS_URL) {
-      throw new Error(
-        "The environment variable VITE_TERMINAL_WS_URL is not set. Please set it to the WebSocket URL of the terminal server.",
-      );
-    }
-    const socket = new WebSocket(WS_URL as string);
     const jsonWebsocketAddon = new JsonWebsocketAddon(socket);
     terminal.loadAddon(jsonWebsocketAddon);
 
@@ -74,7 +85,16 @@ function Terminal(): JSX.Element {
     };
   }, []);
 
-  return <div ref={terminalRef} style={{ width: "100%", height: "100%" }} />;
+  return (
+    <div
+      ref={terminalRef}
+      style={{
+        width: "100%",
+        height: "100%",
+        display: hidden ? "none" : "block",
+      }}
+    />
+  );
 }
 
 export default Terminal;

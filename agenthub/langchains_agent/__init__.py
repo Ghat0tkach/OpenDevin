@@ -1,11 +1,31 @@
-import os
-import argparse
-from typing import List, Dict, Type
+from typing import List
 
-from opendevin.agent import Agent, Message
+from opendevin.llm.llm import LLM
+from opendevin.agent import Agent
+from opendevin.state import State
+from opendevin.action import Action
+import agenthub.langchains_agent.utils.prompts as prompts
+from agenthub.langchains_agent.utils.monologue import Monologue
+from agenthub.langchains_agent.utils.memory import LongTermMemory
 
-from agenthub.langchains_agent.utils.agent import Agent as LangchainsAgentImpl
-from opendevin.lib.event import Event
+from opendevin.action import (
+    NullAction,
+    CmdRunAction,
+    CmdKillAction,
+    BrowseURLAction,
+    FileReadAction,
+    FileWriteAction,
+    AgentRecallAction,
+    AgentThinkAction,
+    AgentFinishAction,
+)
+from opendevin.observation import (
+    CmdOutputObservation,
+)
+
+
+MAX_MONOLOGUE_LENGTH = 20000
+MAX_OUTPUT_LENGTH = 5000
 
 INITIAL_THOUGHTS = [
     "I exist!",
@@ -49,52 +69,114 @@ INITIAL_THOUGHTS = [
 class LangchainsAgent(Agent):
     _initialized = False
 
+    def __init__(self, llm: LLM):
+        super().__init__(llm)
+        self.monologue = Monologue()
+        self.memory = LongTermMemory()
+
+    def _add_event(self, event: dict):
+        if 'output' in event['args'] and len(event['args']['output']) > MAX_OUTPUT_LENGTH:
+            event['args']['output'] = event['args']['output'][:MAX_OUTPUT_LENGTH] + "..."
+
+        self.monologue.add_event(event)
+        self.memory.add_event(event)
+        if self.monologue.get_total_length() > MAX_MONOLOGUE_LENGTH:
+            self.monologue.condense(self.llm)
+
     def _initialize(self):
         if self._initialized:
             return
-        self.agent = LangchainsAgentImpl(self.instruction)
+
+        if self.instruction is None or self.instruction == "":
+            raise ValueError("Instruction must be provided")
+        self.monologue = Monologue()
+        self.memory = LongTermMemory()
+
         next_is_output = False
         for thought in INITIAL_THOUGHTS:
             thought = thought.replace("$TASK", self.instruction)
             if next_is_output:
-                event = Event("output", {"output": thought})
+                d = {"action": "output", "args": {"output": thought}}
                 next_is_output = False
             else:
                 if thought.startswith("RUN"):
                     command = thought.split("RUN ")[1]
-                    event = Event("run", {"command": command})
+                    d = {"action": "run", "args": {"command": command}}
                     next_is_output = True
+
                 elif thought.startswith("RECALL"):
                     query = thought.split("RECALL ")[1]
-                    event = Event("recall", {"query": query})
+                    d = {"action": "recall", "args": {"query": query}}
                     next_is_output = True
+
                 elif thought.startswith("BROWSE"):
                     url = thought.split("BROWSE ")[1]
-                    event = Event("browse", {"url": url})
+                    d = {"action": "browse", "args": {"url": url}}
                     next_is_output = True
                 else:
-                    event = Event("think", {"thought": thought})
-            self.agent.add_event(event)
+                    d = {"action": "think", "args": {"thought": thought}}
+
+            self._add_event(d)
         self._initialized = True
 
-    def add_event(self, event: Event) -> None:
-        self.agent.add_event(event)
-
-    def step(self, cmd_mgr) -> Event:
+    def step(self, state: State) -> Action:
         self._initialize()
-        return self.agent.get_next_action(cmd_mgr)
+        # TODO: make langchains agent use Action & Observation
+        # completly from ground up
+
+        # Translate state to action_dict
+        for prev_action, obs in state.updated_info:
+            d = None
+            if isinstance(obs, CmdOutputObservation):
+                if obs.error:
+                    d = {"action": "error", "args": {"output": obs.content}}
+                else:
+                    d = {"action": "output", "args": {"output": obs.content}}
+            else:
+                d = {"action": "output", "args": {"output": obs.content}}
+            if d is not None:
+                self._add_event(d)
+
+            d = None
+            if isinstance(prev_action, CmdRunAction):
+                d = {"action": "run", "args": {"command": prev_action.command}}
+            elif isinstance(prev_action, CmdKillAction):
+                d = {"action": "kill", "args": {"id": prev_action.id}}
+            elif isinstance(prev_action, BrowseURLAction):
+                d = {"action": "browse", "args": {"url": prev_action.url}}
+            elif isinstance(prev_action, FileReadAction):
+                d = {"action": "read", "args": {"file": prev_action.path}}
+            elif isinstance(prev_action, FileWriteAction):
+                d = {"action": "write", "args": {"file": prev_action.path, "content": prev_action.contents}}
+            elif isinstance(prev_action, AgentRecallAction):
+                d = {"action": "recall", "args": {"query": prev_action.query}}
+            elif isinstance(prev_action, AgentThinkAction):
+                d = {"action": "think", "args": {"thought": prev_action.thought}}
+            elif isinstance(prev_action, AgentFinishAction):
+                d = {"action": "finish"}
+            elif isinstance(prev_action, NullAction):
+                d = None
+            else:
+                raise ValueError(f"Unknown action type: {prev_action}")
+            if d is not None:
+                self._add_event(d)
+
+        state.updated_info = []
+
+        prompt = prompts.get_request_action_prompt(
+            self.instruction,
+            self.monologue.get_thoughts(),
+            state.background_commands_obs,
+        )
+        messages = [{"content": prompt,"role": "user"}]
+        resp = self.llm.completion(messages=messages)
+        action_resp = resp['choices'][0]['message']['content']
+        action = prompts.parse_action_response(action_resp)
+        self.latest_action = action
+        return action
 
     def search_memory(self, query: str) -> List[str]:
-        return self.agent.memory.search(query)
+        return self.memory.search(query)
 
-    def chat(self, message: str) -> None:
-        """
-        Optional method for interactive communication with the agent during its execution. Implementations
-        can use this method to modify the agent's behavior or state based on chat inputs.
-
-        Parameters:
-        - message (str): The chat message or command.
-        """
-        raise NotImplementedError
 
 Agent.register("LangchainsAgent", LangchainsAgent)

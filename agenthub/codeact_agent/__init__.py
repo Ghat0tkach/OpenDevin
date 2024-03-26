@@ -1,12 +1,23 @@
 import os
 import re
-import argparse
-from litellm import completion
-from termcolor import colored
-from typing import List, Dict
+from typing import List, Mapping
 
-from opendevin.agent import Agent, Message, Role
-from opendevin.sandbox.docker import DockerInteractive
+from termcolor import colored
+
+from opendevin.agent import Agent
+from opendevin.state import State
+from opendevin.action import (
+    Action,
+    CmdRunAction,
+    AgentEchoAction,
+    AgentFinishAction,
+)
+from opendevin.observation import (
+    CmdOutputObservation,
+    AgentMessageObservation,
+)
+
+from opendevin.llm.llm import LLM
 
 assert (
     "OPENAI_API_KEY" in os.environ
@@ -52,10 +63,7 @@ def parse_response(response) -> str:
 class CodeActAgent(Agent):
     def __init__(
         self,
-        instruction: str,
-        workspace_dir: str,
-        model_name: str,
-        max_steps: int = 100
+        llm: LLM,
     ) -> None:
         """
         Initializes a new instance of the CodeActAgent class.
@@ -64,61 +72,66 @@ class CodeActAgent(Agent):
         - instruction (str): The instruction for the agent to execute.
         - max_steps (int): The maximum number of steps to run the agent.
         """
-        super().__init__(instruction, workspace_dir, model_name, max_steps)
-        self._history = [Message(Role.SYSTEM, SYSTEM_MESSAGE)]
-        self._history.append(Message(Role.USER, instruction))
-        self.env = DockerInteractive(workspace_dir=workspace_dir)
-        print(colored("===USER:===\n" + instruction, "green"))
+        super().__init__(llm)
+        self.messages: List[Mapping[str, str]] = []
+        self.instruction: str = ""
 
-    def _history_to_messages(self) -> List[Dict]:
-        return [message.to_dict() for message in self._history]
+    def step(self, state: State) -> Action:
+        if len(self.messages) == 0:
+            assert self.instruction, "Expecting instruction to be set"
+            self.messages = [
+                {"role": "system", "content": SYSTEM_MESSAGE},
+                {"role": "user", "content": self.instruction},
+            ]
+            print(colored("===USER:===\n" + self.instruction, "green"))
+        updated_info = state.updated_info
+        if updated_info:
+            for prev_action, obs in updated_info:
+                assert isinstance(prev_action, (CmdRunAction, AgentEchoAction)), "Expecting CmdRunAction or AgentEchoAction for Action"
+                if isinstance(obs, AgentMessageObservation):  # warning message from itself
+                    self.messages.append({"role": "user", "content": obs.content})
+                    print(colored("===USER:===\n" + obs.content, "green"))
+                elif isinstance(obs, CmdOutputObservation):
+                    content = "OBSERVATION:\n" + obs.content
+                    content += f"\n[Command {obs.command_id} finished with exit code {obs.exit_code}]]"
+                    self.messages.append({"role": "user", "content": content})
+                    print(colored("===ENV OBSERVATION:===\n" + content, "blue"))
+                else:
+                    raise NotImplementedError(f"Unknown observation type: {obs.__class__}")
+        response = self.llm.completion(
+            messages=self.messages,
+            stop=["</execute>"],
+            temperature=0.0,
+            seed=42,
+        )
+        action_str: str = parse_response(response)
+        self.messages.append({"role": "assistant", "content": action_str})
+        print(colored("===ASSISTANT:===\n" + action_str, "yellow"))
 
-    def run(self) -> None:
-        """
-        Starts the execution of the assigned instruction. This method should
-        be implemented by subclasses to define the specific execution logic.
-        """
-        for _ in range(self.max_steps):
-            response = completion(
-                messages=self._history_to_messages(),
-                model=self.model_name,
-                stop=["</execute>"],
-                temperature=0.0,
-                seed=42,
-            )
-            action = parse_response(response)
-            self._history.append(Message(Role.ASSISTANT, action))
-            print(colored("===ASSISTANT:===\n" + action, "yellow"))
+        command = re.search(r"<execute>(.*)</execute>", action_str, re.DOTALL)
+        if command is not None:
+            # a command was found
+            command_group = command.group(1)
+            if command_group.strip() == "exit":
+                print(colored("Exit received. Exiting...", "red"))
+                return AgentFinishAction()
+            return CmdRunAction(command = command_group)
+            # # execute the code
+            # # TODO: does exit_code get loaded into Message?
+            # exit_code, observation = self.env.execute(command_group)
+            # self._history.append(Message(Role.ASSISTANT, observation))
+            # print(colored("===ENV OBSERVATION:===\n" + observation, "blue"))
+        else:
+            # we could provide a error message for the model to continue similar to
+            # https://github.com/xingyaoww/mint-bench/blob/main/mint/envs/general_env.py#L18-L23
+            # observation = INVALID_INPUT_MESSAGE
+            # self._history.append(Message(Role.ASSISTANT, observation))
+            # print(colored("===ENV OBSERVATION:===\n" + observation, "blue"))
+            return AgentEchoAction(content=INVALID_INPUT_MESSAGE)  # warning message to itself
 
-            command = re.search(r"<execute>(.*)</execute>", action, re.DOTALL)
-            if command is not None:
-                # a command was found
-                command = command.group(1)
-                if command.strip() == "exit":
-                    print(colored("Exit received. Exiting...", "red"))
-                    break
-                # execute the code
-                observation = self.env.execute(command)
-                self._history.append(Message(Role.ASSISTANT, observation))
-                print(colored("===ENV OBSERVATION:===\n" + observation, "blue"))
-            else:
-                # we could provide a error message for the model to continue similar to
-                # https://github.com/xingyaoww/mint-bench/blob/main/mint/envs/general_env.py#L18-L23
-                observation = INVALID_INPUT_MESSAGE
-                self._history.append(Message(Role.ASSISTANT, observation))
-                print(colored("===ENV OBSERVATION:===\n" + observation, "blue"))
 
-        self.env.close()
-
-    def chat(self, message: str) -> None:
-        """
-        Optional method for interactive communication with the agent during its execution. Implementations
-        can use this method to modify the agent's behavior or state based on chat inputs.
-
-        Parameters:
-        - message (str): The chat message or command.
-        """
-        raise NotImplementedError
+    def search_memory(self, query: str) -> List[str]:
+        raise NotImplementedError("Implement this abstract method")
 
 
 Agent.register("CodeActAgent", CodeActAgent)
